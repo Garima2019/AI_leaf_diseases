@@ -1,8 +1,9 @@
 import streamlit as st
-import requests
 from PIL import Image
-import io
 import json
+import tempfile
+import os
+from disease_analyzer import LeafDiseaseAnalyzer
 
 # Page configuration
 st.set_page_config(
@@ -68,9 +69,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# API endpoint
-API_URL = "http://localhost:8000"
-
 # Header
 st.markdown('<h1 class="main-header">🌿 AI Leaf Disease Detection System</h1>', unsafe_allow_html=True)
 st.markdown("### Upload a leaf image to detect diseases and get treatment recommendations")
@@ -85,7 +83,7 @@ with st.sidebar:
     - Recommend treatments
     - Provide prevention tips
     """)
-    
+
     st.header("📊 Supported Features")
     st.success("""
     ✅ Multiple disease detection
@@ -94,6 +92,11 @@ with st.sidebar:
     ✅ Organic alternatives
     ✅ Prevention measures
     """)
+
+# Lazy-load analyzer (cached so it's only created once per session)
+@st.cache_resource
+def get_analyzer():
+    return LeafDiseaseAnalyzer()
 
 # Main content
 col1, col2 = st.columns([1, 1])
@@ -105,47 +108,52 @@ with col1:
         type=['png', 'jpg', 'jpeg'],
         help="Upload a clear image of the plant leaf"
     )
-    
+
     if uploaded_file:
         image = Image.open(uploaded_file)
         st.image(image, caption="Uploaded Image", use_column_width=True)
-        
+
         if st.button("🔍 Analyze Leaf", type="primary"):
-            with st.spinner("Analyzing image..."):
+            with st.spinner("Analyzing image with Llama Vision..."):
                 try:
-                    # Prepare file for API
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                    
-                    # Send request to API
-                    response = requests.post(f"{API_URL}/analyze-leaf", files=files)
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        # Store in session state
+                    analyzer = get_analyzer()
+
+                    # Save uploaded bytes to a temp file so the analyzer can read it
+                    suffix = os.path.splitext(uploaded_file.name)[-1] or ".jpg"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(uploaded_file.getvalue())
+                        tmp_path = tmp.name
+
+                    result = analyzer.analyze_leaf(tmp_path)
+                    os.unlink(tmp_path)  # clean up temp file
+
+                    if result["success"]:
+                        structured_data = analyzer.extract_structured_data(result["analysis"])
+
                         st.session_state['analysis'] = result['analysis']
-                        st.session_state['structured_data'] = result['structured_data']
-                        st.session_state['model'] = result['model_used']
-                        
+                        st.session_state['structured_data'] = structured_data
+                        st.session_state['model'] = result['model']
+
                         st.success("✅ Analysis complete!")
                     else:
-                        st.error(f"Error: {response.json().get('detail', 'Unknown error')}")
-                        
+                        st.error(f"Analysis failed: {result.get('error', 'Unknown error')}")
+
                 except Exception as e:
-                    st.error(f"Connection error: {str(e)}")
-                    st.info("Make sure the FastAPI server is running on http://localhost:8000")
+                    st.error(f"Error: {str(e)}")
 
 with col2:
     st.subheader("📋 Analysis Results")
-    
+
     if 'analysis' in st.session_state:
         # Display structured data first for disease status
         try:
-            structured = json.loads(st.session_state['structured_data'])
+            raw = st.session_state['structured_data']
+            # Strip potential markdown code fences from the model response
+            clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            structured = json.loads(clean)
             is_diseased = structured.get('is_diseased', True)
             disease_name = structured.get('disease_name', 'Unknown')
-            
-            # Disease Status Indicator with colored dot
+
             if is_diseased:
                 st.markdown(f"""
                     <div class="disease-indicator diseased">
@@ -160,55 +168,51 @@ with col2:
                         <span>✅ HEALTHY LEAF</span>
                     </div>
                 """, unsafe_allow_html=True)
-            
-        except json.JSONDecodeError:
+
+        except (json.JSONDecodeError, AttributeError):
             st.warning("Could not parse disease status")
-        
-        # Display full analysis
+            is_diseased = True
+            structured = {}
+
+        # Full analysis text
         st.markdown('<div class="analysis-box">', unsafe_allow_html=True)
         st.markdown(st.session_state['analysis'])
         st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Display detailed structured data
+
+        # Detailed structured data
         st.subheader("📊 Detailed Analysis")
-        try:
-            structured = json.loads(st.session_state['structured_data'])
-            
+        if structured:
             col_a, col_b = st.columns(2)
             with col_a:
                 disease_display = structured.get('disease_name', 'N/A')
                 severity_display = structured.get('severity', 'N/A')
-                
-                # Color code the metrics
+
                 if is_diseased:
                     st.markdown(f"**Disease:** :red[{disease_display}]")
                     st.markdown(f"**Severity:** :red[{severity_display}]")
                 else:
                     st.markdown(f"**Status:** :green[{disease_display}]")
                     st.markdown(f"**Severity:** :green[{severity_display}]")
-                    
+
             with col_b:
                 st.metric("Confidence", structured.get('confidence', 'N/A'))
                 st.metric("Model", st.session_state.get('model', 'N/A'))
-            
-            if 'symptoms' in structured and structured['symptoms']:
+
+            if structured.get('symptoms'):
                 st.write("**🔍 Symptoms Observed:**")
                 for symptom in structured['symptoms']:
                     st.write(f"- {symptom}")
-            
-            if 'treatments' in structured and structured['treatments']:
+
+            if structured.get('treatments'):
                 st.write("**💊 Recommended Treatments:**")
                 for treatment in structured['treatments']:
                     st.write(f"- {treatment}")
-            
-            if 'prevention' in structured and structured['prevention']:
+
+            if structured.get('prevention'):
                 st.write("**🛡️ Prevention Measures:**")
                 for prevention in structured['prevention']:
                     st.write(f"- {prevention}")
-                    
-        except json.JSONDecodeError:
-            st.warning("Could not parse detailed analysis data")
-        
+
         # Download report
         if st.button("📥 Download Report"):
             report = f"""
@@ -233,6 +237,6 @@ Model: {st.session_state.get('model', 'N/A')}
 # Footer
 st.markdown("---")
 st.markdown(
-    "<p style='text-align: center; color: gray;'>Powered by Llama Vision (Groq) | FastAPI | Streamlit</p>",
+    "<p style='text-align: center; color: gray;'>Powered by Llama Vision (Groq) | Streamlit</p>",
     unsafe_allow_html=True
 )
